@@ -98,8 +98,6 @@ func (s *Server) newScanWriter(
 		msg:         msg,
 		cursor:      cursor,
 		limit:       limit,
-		wheres:      wheres,
-		whereins:    whereins,
 		whereevals:  whereevals,
 		output:      output,
 		nofields:    nofields,
@@ -118,6 +116,27 @@ func (s *Server) newScanWriter(
 	if sw.col != nil {
 		sw.fmap = sw.col.FieldMap()
 		sw.farr = sw.col.FieldArr()
+		// This fills index value in wheres/whereins
+		// so we don't have to map string field names for each tested object
+		var ok bool
+		if len(wheres) > 0 {
+			sw.wheres = make([]whereT, len(wheres))
+			for i, where := range wheres {
+				if where.index, ok = sw.fmap[where.field]; !ok {
+					where.index = math.MaxInt32
+				}
+				sw.wheres[i] = where
+			}
+		}
+		if len(whereins) > 0 {
+			sw.whereins = make([]whereinT, len(whereins))
+			for i, wherein := range whereins {
+				if wherein.index, ok = sw.fmap[wherein.field]; !ok {
+					wherein.index = math.MaxInt32
+				}
+				sw.whereins[i] = wherein
+			}
+		}
 	}
 	sw.fvals = make([]float64, len(sw.farr))
 	return sw, nil
@@ -213,11 +232,8 @@ func (sw *scanWriter) fieldMatch(fields []float64, o geojson.Object) (fvals []fl
 				continue
 			}
 			var value float64
-			idx, ok := sw.fmap[where.field]
-			if ok {
-				if len(fields) > idx {
-					value = fields[idx]
-				}
+			if where.index < len(fields) {
+				value = fields[where.index]
 			}
 			if !where.match(value) {
 				return
@@ -225,11 +241,8 @@ func (sw *scanWriter) fieldMatch(fields []float64, o geojson.Object) (fvals []fl
 		}
 		for _, wherein := range sw.whereins {
 			var value float64
-			idx, ok := sw.fmap[wherein.field]
-			if ok {
-				if len(fields) > idx {
-					value = fields[idx]
-				}
+			if wherein.index < len(fields) {
+				value = fields[wherein.index]
 			}
 			if !wherein.match(value) {
 				return
@@ -249,12 +262,10 @@ func (sw *scanWriter) fieldMatch(fields []float64, o geojson.Object) (fvals []fl
 			}
 		}
 	} else {
-		for idx := range sw.farr {
-			var value float64
-			if len(fields) > idx {
-				value = fields[idx]
-			}
-			sw.fvals[idx] = value
+		copy(sw.fvals, fields)
+		// fields might be shorter for this item, need to pad sw.fvals with zeros
+		for i := len(fields); i < len(sw.fvals); i++ {
+			sw.fvals[i] = 0
 		}
 		for _, where := range sw.wheres {
 			if where.field == "z" {
@@ -269,9 +280,8 @@ func (sw *scanWriter) fieldMatch(fields []float64, o geojson.Object) (fvals []fl
 				continue
 			}
 			var value float64
-			idx, ok := sw.fmap[where.field]
-			if ok {
-				value = sw.fvals[idx]
+			if where.index < len(sw.fvals) {
+				value = sw.fvals[where.index]
 			}
 			if !where.match(value) {
 				return
@@ -279,9 +289,8 @@ func (sw *scanWriter) fieldMatch(fields []float64, o geojson.Object) (fvals []fl
 		}
 		for _, wherein := range sw.whereins {
 			var value float64
-			idx, ok := sw.fmap[wherein.field]
-			if ok {
-				value = sw.fvals[idx]
+			if wherein.index < len(sw.fvals) {
+				value = sw.fvals[wherein.index]
 			}
 			if !wherein.match(value) {
 				return
@@ -338,13 +347,11 @@ func (sw *scanWriter) Step(n uint64) {
 
 // ok is whether the object passes the test and should be written
 // keepGoing is whether there could be more objects to test
-func (sw *scanWriter) testObject(id string, o geojson.Object, fields []float64, ignoreGlobMatch bool) (
+func (sw *scanWriter) testObject(id string, o geojson.Object, fields []float64) (
 	ok, keepGoing bool, fieldVals []float64) {
-	if !ignoreGlobMatch {
-		match, kg := sw.globMatch(id, o)
-		if !match {
-			return false, kg, fieldVals
-		}
+	match, kg := sw.globMatch(id, o)
+	if !match {
+		return false, kg, fieldVals
 	}
 	nf, ok := sw.fieldMatch(fields, o)
 	return ok, true, nf
@@ -356,13 +363,9 @@ func (sw *scanWriter) writeObject(opts ScanWriterParams) bool {
 		sw.mu.Lock()
 		defer sw.mu.Unlock()
 	}
-	var ok bool
-	keepGoing := true
-	if !opts.skipTesting {
-		ok, keepGoing, _ = sw.testObject(opts.id, opts.o, opts.fields, opts.ignoreGlobMatch)
-		if !ok {
-			return keepGoing
-		}
+	ok, keepGoing, _ := sw.testObject(opts.id, opts.o, opts.fields)
+	if !ok {
+		return keepGoing
 	}
 	sw.count++
 	if sw.output == outputCount {
